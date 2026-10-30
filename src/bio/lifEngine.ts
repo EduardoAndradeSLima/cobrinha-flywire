@@ -93,7 +93,7 @@ export class FlyWireLIFEngine {
   private wIndices: Int32Array | null = null
   private wData: Float32Array | null = null
 
-  // Buffers pré-alocados para os 3.189 neurônios (evita GC a cada passo)
+  // Buffers pré-alocados para os 3.189 neurônios
   private vBuf: Float32Array = new Float32Array(0)
   private iSynBuf: Float32Array = new Float32Array(0)
   private aBuf: Float32Array = new Float32Array(0)
@@ -182,9 +182,9 @@ export class FlyWireLIFEngine {
   }
 
   /**
-   * Executa o modelo visual retinotópico (EyeModel de flysnake/eye.py) +
-   * simulação LIF de 250ms dos 3.189 neurônios (flysnake/brain.py) +
-   * leitura das populações descendentes DNa/DNp (flysnake/controller.py).
+   * 1. EyeModel (flysnake/eye.py): converte a visão egocêntrica da maçã (LC10a) e obstáculos (LC4/LPLC2) em corrente sensorial (mV/ms).
+   * 2. LIFNet (flysnake/brain.py): integra os 3.189 neurônios e 2.100.007 sinapses por 250ms.
+   * 3. FlyController (flysnake/controller.py): lê EXCLUSIVAMENTE os disparos dos neurônios descendentes (sL, sR, eL, eR, gL, gR) para decidir a curva.
    */
   public stepConnectome(
     head: Point,
@@ -233,7 +233,7 @@ export class FlyWireLIFEngine {
     const leftBlocked = isBlocked(leftPt)
     const rightBlocked = isBlocked(rightPt)
 
-    // Geometria egocêntrica para a comida (EyeModel de flybrain-snake)
+    // Geometria egocêntrica vista pelos olhos compostos na cabeça da cobra (EyeModel de flysnake/eye.py)
     const dx = food.x - head.x
     const dy = food.y - head.y
     const fwdProj = dx * hx + dy * hy
@@ -257,18 +257,11 @@ export class FlyWireLIFEngine {
       const twoElSigma2 = 2.0 * 90.0 * 90.0
       const elRef = meta.el_ref
 
-      // 1. Canal de Pequenos Objetos (LC10a - Comida): drive em mV/ms conforme flysnake/eye.py
-      if (dist > 0 && Math.abs(azDeg) >= 5.0) {
+      // 1. Estímulo Visual da Comida nos neurônios LC10a (EyeModel)
+      if (dist > 0 && Math.abs(azDeg) >= 5.0 && !fwdBlocked) {
         let azM = 0.0
         if (Math.abs(azDeg) > 135.0) {
-          // Comida para trás: se uma lateral é parede/corpo, estimula o olho do lado livre (desgruda da parede!)
-          if (leftBlocked && !rightBlocked) {
-            azM = 55.0
-          } else if (rightBlocked && !leftBlocked) {
-            azM = -55.0
-          } else {
-            azM = azDeg >= 0 ? 55.0 : -55.0
-          }
+          azM = leftBlocked && !rightBlocked ? 55.0 : rightBlocked && !leftBlocked ? -55.0 : azDeg >= 0 ? 55.0 : -55.0
         } else {
           const sign = azDeg > 0 ? 1.0 : -1.0
           azM = sign * Math.max(Math.min(Math.abs(azDeg), 55.0), 35.0)
@@ -288,26 +281,53 @@ export class FlyWireLIFEngine {
         }
       }
 
-      // 2. Canal de Expansão / Obstáculos (LC4 + LPLC2): ativa quando há obstáculo à frente
-      if (config.giantFiberEnabled && fwdBlocked) {
-        const azL = leftBlocked ? -45.0 : rightBlocked ? 45.0 : 0.0
-        const loomGain = 1.2
+      // 2. Estímulo Visual de Obstáculos nos neurônios LC4 e LPLC2 (EyeModel)
+      if (config.giantFiberEnabled) {
         const loomIds = meta.loom_ids
         const loomAz = meta.loom_az
         const loomEl = meta.loom_el
 
-        for (let i = 0; i < loomIds.length; i++) {
-          const dAz = loomAz[i] - azL
-          const dEl = loomEl[i] - elRef
-          const w = Math.exp(-(dAz * dAz) / twoAzSigma2 - (dEl * dEl) / twoElSigma2)
-          const val = loomGain * w
-          if (val > drive[loomIds[i]]) {
-            drive[loomIds[i]] = val
+        if (fwdBlocked) {
+          // Obstáculo iminente à frente: excita LC4/LPLC2 no lado bloqueado (para que o escape contralateral DNp vire para o lado livre)
+          const azL = leftBlocked ? -45.0 : rightBlocked ? 45.0 : azDeg < 0 ? 45.0 : -45.0
+          const loomGain = 1.25
+          for (let i = 0; i < loomIds.length; i++) {
+            const dAz = loomAz[i] - azL
+            const dEl = loomEl[i] - elRef
+            const w = Math.exp(-(dAz * dAz) / twoAzSigma2 - (dEl * dEl) / twoElSigma2)
+            const val = loomGain * w
+            if (val > drive[loomIds[i]]) {
+              drive[loomIds[i]] = val
+            }
+          }
+        } else {
+          // Obstáculos adjacentes a 90° nas laterais excitam LC4/LPLC2 ipsilaterais
+          if (leftBlocked) {
+            for (let i = 0; i < loomIds.length; i++) {
+              const dAz = loomAz[i] - -45.0
+              const dEl = loomEl[i] - elRef
+              const w = Math.exp(-(dAz * dAz) / twoAzSigma2 - (dEl * dEl) / twoElSigma2)
+              const val = 1.05 * w
+              if (val > drive[loomIds[i]]) {
+                drive[loomIds[i]] = val
+              }
+            }
+          }
+          if (rightBlocked) {
+            for (let i = 0; i < loomIds.length; i++) {
+              const dAz = loomAz[i] - 45.0
+              const dEl = loomEl[i] - elRef
+              const w = Math.exp(-(dAz * dAz) / twoAzSigma2 - (dEl * dEl) / twoElSigma2)
+              const val = 1.05 * w
+              if (val > drive[loomIds[i]]) {
+                drive[loomIds[i]] = val
+              }
+            }
           }
         }
       }
 
-      // 3. Integração LIF de 250ms nos 3.189 neurônios (LIFNet.step de flysnake/brain.py)
+      // 3. Integração LIF de 250ms nos 3.189 neurônios reais (LIFNet.step de flysnake/brain.py)
       const v = this.vBuf
       const iSyn = this.iSynBuf
       const a = this.aBuf
@@ -383,7 +403,8 @@ export class FlyWireLIFEngine {
         q1 = tmp
       }
 
-      // 4. Leitura das populações descendentes (FlyController de flysnake/controller.py)
+      // 4. Leitura 100% Neural dos Neurônios Descendentes (FlyController de flysnake/controller.py)
+      // NENHUMA variável geométrica entra aqui: a ação depende exclusivamente dos disparos sL, sR, eL, eR, gL, gR!
       const sL = this.sumGroupSpikes(['DNa02_L', 'DNa01_L', 'DNa03_L', 'DNa13_L', 'DNa15_L'])
       const sR = this.sumGroupSpikes(['DNa02_R', 'DNa01_R', 'DNa03_R', 'DNa13_R', 'DNa15_R'])
       const eL = this.sumGroupSpikes(['DNp02_L', 'DNp03_L', 'DNp04_L', 'DNp11_L'])
@@ -403,38 +424,21 @@ export class FlyWireLIFEngine {
       let motorCommand: 'STRAIGHT' | 'TURN_LEFT' | 'TURN_RIGHT' = 'STRAIGHT'
       let reflexActive = false
 
-      if (
+      if ((gL + gR) >= 90 && (sL + sR) < 15) {
+        // Emergência frontal detectada pela Fibra Gigante (DNp01) e neurônios de escape (DNp02/03/04/11):
+        // Escape contralateral puro (Card & Dickinson 2008): ameaça à esquerda (eL > eR) vira à DIREITA e vice-versa
+        reflexActive = true
+        motorCommand = eL >= eR ? 'TURN_RIGHT' : 'TURN_LEFT'
+      } else if (
         Math.max(sL, sR) >= 6 &&
         Math.abs(sL - sR) >= Math.max(3, 0.35 * (sL + sR))
       ) {
-        if (sL > sR && !leftBlocked) {
+        // Perseguição ipsilateral (LC10a -> AOTU019 -> DNa02):
+        // Vira para o olho que vê a maçã, a menos que o neurônio de escape daquele lado (eL ou eR >= 120) vete a curva!
+        if (sL > sR && eL < 120) {
           motorCommand = 'TURN_LEFT'
-        } else if (sR > sL && !rightBlocked) {
+        } else if (sR > sL && eR < 120) {
           motorCommand = 'TURN_RIGHT'
-        } else if (fwdBlocked || fwdProj < 0) {
-          // Se o lado desejado está bloqueado pela parede e a comida está para trás, vira para o lado livre
-          if (!leftBlocked) motorCommand = 'TURN_LEFT'
-          else if (!rightBlocked) motorCommand = 'TURN_RIGHT'
-        }
-      }
-
-      if (config.giantFiberEnabled) {
-        const chosenBlocked =
-          (motorCommand === 'STRAIGHT' && fwdBlocked) ||
-          (motorCommand === 'TURN_LEFT' && leftBlocked) ||
-          (motorCommand === 'TURN_RIGHT' && rightBlocked)
-
-        if (chosenBlocked) {
-          reflexActive = true
-          if (!fwdBlocked && motorCommand !== 'STRAIGHT') {
-            motorCommand = 'STRAIGHT'
-          } else if (!leftBlocked && rightBlocked) {
-            motorCommand = 'TURN_LEFT'
-          } else if (!rightBlocked && leftBlocked) {
-            motorCommand = 'TURN_RIGHT'
-          } else if (!leftBlocked && !rightBlocked) {
-            motorCommand = sL > sR || azDeg < 0 ? 'TURN_LEFT' : 'TURN_RIGHT'
-          }
         }
       }
 
@@ -448,10 +452,10 @@ export class FlyWireLIFEngine {
         LPLC2_R: Math.round(lplc2R / 12),
         AOTU019_L: Math.round(aotuL / 3),
         AOTU019_R: Math.round(aotuR / 3),
-        AOTU_Center: Math.abs(azDeg) < 8 ? 14 : Math.max(0, 8 - Math.round(Math.abs(sL - sR) / 4)),
+        AOTU_Center: Math.abs(sL - sR) <= 3 ? 14 : Math.max(0, 8 - Math.round(Math.abs(sL - sR) / 4)),
         DNp04_L: eL,
         DNp04_R: eR,
-        DNp01_GF: gL + gR + (reflexActive ? 8 : 0),
+        DNp01_GF: gL + gR,
         DNa02_L: sL,
         DNa02_R: sR,
         DNa01_Forward: motorCommand === 'STRAIGHT' ? Math.max(12, Math.round((sL + sR) / 2)) : 2,
@@ -494,30 +498,12 @@ export class FlyWireLIFEngine {
       }
     }
 
-    // Fallback instantâneo enquanto o binário de 3.189 neurônios carrega
-    let fallbackCmd: 'STRAIGHT' | 'TURN_LEFT' | 'TURN_RIGHT' = 'STRAIGHT'
-    if (Math.abs(azDeg) >= 10) {
-      if (azDeg < 0 && !leftBlocked) fallbackCmd = 'TURN_LEFT'
-      else if (azDeg > 0 && !rightBlocked) fallbackCmd = 'TURN_RIGHT'
-      else if (fwdProj < 0) {
-        if (!leftBlocked) fallbackCmd = 'TURN_LEFT'
-        else if (!rightBlocked) fallbackCmd = 'TURN_RIGHT'
-      }
-    }
-    if (fwdBlocked) {
-      if (!leftBlocked && rightBlocked) fallbackCmd = 'TURN_LEFT'
-      else if (!rightBlocked && leftBlocked) fallbackCmd = 'TURN_RIGHT'
-      else if (!leftBlocked && !rightBlocked) {
-        fallbackCmd = azDeg < 0 ? 'TURN_LEFT' : 'TURN_RIGHT'
-      }
-    }
-
     return {
-      motorCommand: fallbackCmd,
-      leftSpikes: fallbackCmd === 'TURN_LEFT' ? 18 : 2,
-      rightSpikes: fallbackCmd === 'TURN_RIGHT' ? 18 : 2,
-      forwardSpikes: fallbackCmd === 'STRAIGHT' ? 18 : 2,
-      reflexActive: fwdBlocked,
+      motorCommand: 'STRAIGHT',
+      leftSpikes: 0,
+      rightSpikes: 0,
+      forwardSpikes: 0,
+      reflexActive: false,
     }
   }
 
